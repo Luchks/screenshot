@@ -1,9 +1,11 @@
-use minifb::{Key, Window, WindowOptions};
+use minifb::{Key, Window, WindowOptions, Scale};
 use std::process::Command;
 use image::{GenericImageView, RgbaImage};
 
 fn main() {
+    // 1. Captura de pantalla silenciosa
     Command::new("grim").arg("/tmp/screenshot.png").output().unwrap();
+    
     let img = image::open("/tmp/screenshot.png").expect("Error al abrir captura");
     let (width, height) = img.dimensions();
     let (w, h) = (width as usize, height as usize);
@@ -12,12 +14,18 @@ fn main() {
         ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32)
     }).collect();
 
-    let mut window = Window::new("VimShot", w, h, WindowOptions::default()).unwrap();
+    let mut options = WindowOptions::default();
+    options.borderless = true; 
+    options.title = false;      
+    options.scale = Scale::X1;
+
+    let mut window = Window::new("VimShot", w, h, options).expect("Error al abrir");
     window.set_target_fps(60);
 
     let (mut x, mut y) = (w / 2, h / 2);
     let (mut start_x, mut start_y) = (x, y);
     let mut last_r_state = false;
+    let mut last_f_state = false; // Estado para la tecla F (Flecha)
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let step = if window.is_key_down(Key::LeftShift) { 25 } else { 5 };
@@ -33,11 +41,19 @@ fn main() {
             draw_circle(&mut buffer, w, h, start_x, start_y, r, 0x0000FF);
         }
 
+        // Lógica Resaltador (R)
         let current_r_state = window.is_key_down(Key::R);
         if !current_r_state && last_r_state {
             draw_filled_rect(&mut buffer, w, h, start_x, start_y, x, y, 0xFFFF00, 0.35);
         }
         last_r_state = current_r_state;
+
+        // --- NUEVA LÓGICA FLECHA (F) ---
+        let current_f_state = window.is_key_down(Key::F);
+        if !current_f_state && last_f_state {
+            draw_arrow(&mut buffer, w, start_x, start_y, x, y, 0xFF00FF); // Magenta para flechas
+        }
+        last_f_state = current_f_state;
 
         if window.is_key_down(Key::D) {
             buffer = img.to_rgba8().pixels().map(|p| { ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32) }).collect();
@@ -45,8 +61,9 @@ fn main() {
 
         let mut view = buffer.clone();
         if current_r_state { draw_filled_rect(&mut view, w, h, start_x, start_y, x, y, 0xFFFF00, 0.35); }
+        if current_f_state { draw_arrow(&mut view, w, start_x, start_y, x, y, 0xFF00FF); }
 
-        // CURSOR REFORZADO (Borde 3x3 negro)
+        // CURSOR INDESTRUCTIBLE
         let c_size = 12;
         for i in -c_size..=c_size {
             let pts = [(x as i32 + i, y as i32), (x as i32, y as i32 + i)];
@@ -84,12 +101,35 @@ fn main() {
             Command::new("sh").arg("-c").arg(format!("wl-copy --type image/png < {} && rm {}", temp_path, temp_path)).spawn().unwrap();
             std::process::exit(0);
         }
+
         window.update_with_buffer(&view, w, h).unwrap();
     }
 }
 
-// ... (Aquí van tus funciones draw_filled_rect, draw_line y draw_circle que ya tienes)
-// (Son las mismas del mensaje anterior)
+// --- FUNCIONES DE DIBUJO ---
+
+fn draw_arrow(buf: &mut Vec<u32>, w: usize, x0: usize, y0: usize, x1: usize, y1: usize, color: u32) {
+    // Dibujar la línea principal
+    draw_line(buf, w, x0, y0, x1, y1, color);
+
+    // Calcular ángulo de la línea
+    let dx = x1 as f32 - x0 as f32;
+    let dy = y1 as f32 - y0 as f32;
+    let angle = dy.atan2(dx);
+
+    let arrow_size = 20.0;
+    let wing_angle = 0.5; // Ángulo de las aletas de la flecha
+
+    // Aleta 1
+    let x2 = x1 as f32 - arrow_size * (angle - wing_angle).cos();
+    let y2 = y1 as f32 - arrow_size * (angle - wing_angle).sin();
+    draw_line(buf, w, x1, y1, x2 as usize, y2 as usize, color);
+
+    // Aleta 2
+    let x3 = x1 as f32 - arrow_size * (angle + wing_angle).cos();
+    let y3 = y1 as f32 - arrow_size * (angle + wing_angle).sin();
+    draw_line(buf, w, x1, y1, x3 as usize, y3 as usize, color);
+}
 
 fn draw_filled_rect(buf: &mut Vec<u32>, w: usize, h: usize, x0: usize, y0: usize, x1: usize, y1: usize, color: u32, alpha: f32) {
     let x_min = x0.min(x1); let x_max = x0.max(x1);
