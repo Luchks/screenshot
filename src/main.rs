@@ -3,6 +3,7 @@ use std::process::Command;
 use image::{GenericImageView, RgbaImage};
 
 fn main() {
+    // 1. Captura inicial
     Command::new("grim").arg("/tmp/screenshot.png").output().unwrap();
     let img = image::open("/tmp/screenshot.png").expect("Error al abrir captura");
     let (width, height) = img.dimensions();
@@ -24,47 +25,60 @@ fn main() {
     let (mut start_x, mut start_y) = (x, y);
     let mut last_r_state = false;
     let mut last_f_state = false;
+    let mut last_e_state = false;
+    let mut step_counter = 1; 
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
         
-        // --- DETECCIÓN DE VELOCIDAD MEJORADA ---
-        // Usamos solo el estado físico de la tecla para ignorar Bloq Mayús
         let is_turbo = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
         let is_precise = window.is_key_down(Key::LeftAlt) || window.is_key_down(Key::LeftCtrl);
-
         let step = if is_turbo { 25 } else if is_precise { 1 } else { 5 };
 
-        // Movimiento HJKL
         if window.is_key_down(Key::H) { x = x.saturating_sub(step); }
         if window.is_key_down(Key::L) { x = (x + step).min(w - 1); }
         if window.is_key_down(Key::K) { y = y.saturating_sub(step); }
         if window.is_key_down(Key::J) { y = (y + step).min(h - 1); }
 
         if window.is_key_down(Key::V) { start_x = x; start_y = y; }
-        if window.is_key_down(Key::A) { draw_line(&mut buffer, w, start_x, start_y, x, y, 0xFF0000); }
         
-        if window.is_key_down(Key::C) {
-            let r = (((x as f32 - start_x as f32).powi(2) + (y as f32 - start_y as f32).powi(2)).sqrt()) as usize;
-            draw_circle(&mut buffer, w, h, start_x, start_y, r, 0x0000FF);
+        // --- DIBUJO PERMANENTE ---
+        
+        // Al SOLTAR la tecla E, se graba el número actual y se suma 1 al contador
+        let current_e_state = window.is_key_down(Key::E);
+        if !current_e_state && last_e_state {
+            draw_step_badge(&mut buffer, w, h, x, y, step_counter, 0xFF5500); 
+            step_counter += 1; // EL INCREMENTO ES AQUÍ
         }
+        last_e_state = current_e_state;
 
+        // Resaltador (R)
         let current_r_state = window.is_key_down(Key::R);
         if !current_r_state && last_r_state {
             draw_filled_rect(&mut buffer, w, h, start_x, start_y, x, y, 0xFFFF00, 0.35);
         }
         last_r_state = current_r_state;
 
+        // Flecha (F)
         let current_f_state = window.is_key_down(Key::F);
         if !current_f_state && last_f_state {
             draw_arrow(&mut buffer, w, start_x, start_y, x, y, 0xFF00FF);
         }
         last_f_state = current_f_state;
 
+        if window.is_key_down(Key::A) { draw_line(&mut buffer, w, start_x, start_y, x, y, 0xFF0000); }
+
         if window.is_key_down(Key::D) {
             buffer = img.to_rgba8().pixels().map(|p| { ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32) }).collect();
+            step_counter = 1; 
         }
 
+        // --- RENDERIZADO DE VISTA PREVIA ---
         let mut view = buffer.clone();
+        
+        // Si estoy presionando E, muestro el número que se va a poner
+        if current_e_state { 
+            draw_step_badge(&mut view, w, h, x, y, step_counter, 0xFF5500); 
+        }
         if current_r_state { draw_filled_rect(&mut view, w, h, start_x, start_y, x, y, 0xFFFF00, 0.35); }
         if current_f_state { draw_arrow(&mut view, w, start_x, start_y, x, y, 0xFF00FF); }
 
@@ -78,7 +92,56 @@ fn main() {
     }
 }
 
-// --- FUNCIONES DE SOPORTE (Idénticas a las anteriores) ---
+// --- MEJORA: DIBUJO DE NÚMEROS MÁS CLAROS ---
+fn draw_number(buf: &mut Vec<u32>, w: usize, h: usize, x: usize, y: usize, num: usize, color: u32) {
+    let digits = [
+        [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], // 0
+        [0,1,0, 1,1,0, 0,1,0, 0,1,0, 1,1,1], // 1 (con base y gancho)
+        [1,1,1, 0,0,1, 1,1,1, 1,0,0, 1,1,1], // 2
+        [1,1,1, 0,0,1, 1,1,1, 0,0,1, 1,1,1], // 3
+        [1,0,1, 1,0,1, 1,1,1, 0,0,1, 0,0,1], // 4
+        [1,1,1, 1,0,0, 1,1,1, 0,0,1, 1,1,1], // 5
+        [1,1,1, 1,0,0, 1,1,1, 1,0,1, 1,1,1], // 6
+        [1,1,1, 0,0,1, 0,0,1, 0,1,0, 0,1,0], // 7
+        [1,1,1, 1,0,1, 1,1,1, 1,0,1, 1,1,1], // 8
+        [1,1,1, 1,0,1, 1,1,1, 0,0,1, 1,1,1], // 9
+    ];
+
+    let n = num % 10; // Solo 0-9 para este dibujo simple
+    for row in 0..5 {
+        for col in 0..3 {
+            if digits[n][row * 3 + col] == 1 {
+                for dy in 0..2 { // Engrosar un poco el número
+                    for dx in 0..2 {
+                        let px = (x as i32 + col as i32 * 2 - 3 + dx) as usize;
+                        let py = (y as i32 + row as i32 * 2 - 5 + dy) as usize;
+                        if px < w && py < h {
+                            buf[py * w + px] = color;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_step_badge(buf: &mut Vec<u32>, w: usize, h: usize, cx: usize, cy: usize, num: usize, color: u32) {
+    let radius = 14; // Un poco más grande para que se vea bien
+    for dy in -(radius as i32)..=(radius as i32) {
+        for dx in -(radius as i32)..=(radius as i32) {
+            if dx*dx + dy*dy <= (radius*radius) as i32 {
+                let px = cx as i32 + dx;
+                let py = cy as i32 + dy;
+                if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
+                    buf[(py as usize) * w + (px as usize)] = color;
+                }
+            }
+        }
+    }
+    draw_number(buf, w, h, cx, cy, num, 0xFFFFFF);
+}
+
+// --- FUNCIONES DE DIBUJO (Copiar las mismas de antes) ---
 fn render_cursor(view: &mut Vec<u32>, w: usize, h: usize, x: usize, y: usize) {
     let c_size = 12;
     for i in -c_size..=c_size {
@@ -168,21 +231,5 @@ fn draw_line(buf: &mut Vec<u32>, w: usize, x0: usize, y0: usize, x1: usize, y1: 
         let e2 = 2 * err;
         if e2 >= dy { err += dy; x0 += sx; }
         if e2 <= dx { err += dx; y0 += sy; }
-    }
-}
-
-fn draw_circle(buf: &mut Vec<u32>, w: usize, h: usize, cx: usize, cy: usize, r: usize, color: u32) {
-    let mut x = r as i32; let mut y = 0i32;
-    let mut err = 0i32;
-    while x >= y {
-        let pts = [(cx as i32 + x, cy as i32 + y), (cx as i32 - x, cy as i32 + y), (cx as i32 + x, cy as i32 - y), (cx as i32 - x, cy as i32 - y), (cx as i32 + y, cy as i32 + x), (cx as i32 - y, cy as i32 + x), (cx as i32 + y, cy as i32 - x), (cx as i32 - y, cy as i32 - x)];
-        for (px, py) in pts {
-            if px >= 0 && px < w as i32 && py >= 0 && py < h as i32 {
-                buf[(py as usize) * w + (px as usize)] = color;
-            }
-        }
-        y += 1;
-        if err <= 0 { err += 2 * y + 1; }
-        else { x -= 1; err += 2 * (y - x) + 1; }
     }
 }
