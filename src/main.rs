@@ -10,13 +10,12 @@ fn main() {
     let (width, height) = img.dimensions();
     let (w, h) = (width as usize, height as usize);
 
-    // Buffer principal (donde se guarda el dibujo real)
     let mut buffer: Vec<u32> = img.to_rgba8().pixels().map(|p| {
         ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32)
     }).collect();
 
     let mut window = Window::new(
-        "VimShot - ENTER para Copiar y Salir",
+        "VimShot - ENTER: Copiar | v: Inicio | a: Flecha | c: Círculo | r: Rectángulo",
         w, h, WindowOptions::default()
     ).expect("No se pudo abrir la ventana");
     
@@ -27,7 +26,6 @@ fn main() {
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
 
-        // Movimiento HJKL (Shift para ir rápido)
         let step = if window.is_key_down(Key::LeftShift) { 25 } else { 5 };
         if window.is_key_down(Key::H) && x > step { x -= step; }
         if window.is_key_down(Key::L) && x < w - step { x += step; }
@@ -41,8 +39,12 @@ fn main() {
             let r = (((x as f32 - start_x as f32).powi(2) + (y as f32 - start_y as f32).powi(2)).sqrt()) as usize;
             draw_circle(&mut buffer, w, h, start_x, start_y, r, 0x0000FF);
         }
+        
+        // --- NUEVA FUNCIONALIDAD: RECTÁNGULO ---
+        if window.is_key_down(Key::R) {
+            draw_rect(&mut buffer, w, h, start_x, start_y, x, y, 0xFFFF00); // Amarillo
+        }
 
-        // --- SALIDA INSTANTÁNEA Y COPIA AL PORTAPAPELES ---
         if window.is_key_down(Key::Enter) {
             let temp_path = "/tmp/vimshot_done.png";
             let mut out_img = RgbaImage::new(width, height);
@@ -56,27 +58,21 @@ fn main() {
             }
             out_img.save(temp_path).unwrap();
 
-            // Usamos 'spawn' para que wl-copy viva aunque el programa muera
             Command::new("sh")
                 .arg("-c")
                 .arg(format!("wl-copy --type image/png < {} && rm {}", temp_path, temp_path))
                 .spawn()
                 .expect("Fallo al copiar");
 
-            println!("✅ Imagen en portapapeles. ¡Adiós!");
-            std::process::exit(0); // Cierre fulminante
+            std::process::exit(0);
         }
 
-
-        // Si presionas 'd' (delete), limpia el buffer con la imagen original
         if window.is_key_down(Key::D) {
             buffer = img.to_rgba8().pixels().map(|p| {
                 ((p[0] as u32) << 16) | ((p[1] as u32) << 8) | (p[2] as u32)
             }).collect();
         }
 
-
-        // Renderizado del cursor (Cruz blanca que NO se guarda en la imagen final)
         let mut view = buffer.clone();
         for i in 0..20 {
             let idx_h = y * w + x.saturating_add(i).saturating_sub(10);
@@ -86,6 +82,25 @@ fn main() {
         }
 
         window.update_with_buffer(&view, w, h).unwrap();
+    }
+}
+
+// --- NUEVA FUNCIÓN PARA DIBUJAR RECTÁNGULOS ---
+fn draw_rect(buf: &mut Vec<u32>, w: usize, h: usize, x0: usize, y0: usize, x1: usize, y1: usize, color: u32) {
+    let x_min = x0.min(x1);
+    let x_max = x0.max(x1);
+    let y_min = y0.min(y1);
+    let y_max = y0.max(y1);
+
+    for x in x_min..=x_max {
+        // Línea superior e inferior
+        if y_min * w + x < buf.len() { buf[y_min * w + x] = color; }
+        if y_max * w + x < buf.len() { buf[y_max * w + x] = color; }
+    }
+    for y in y_min..=y_max {
+        // Línea izquierda y derecha
+        if y * w + x_min < buf.len() { buf[y * w + x_min] = color; }
+        if y * w + x_max < buf.len() { buf[y * w + x_max] = color; }
     }
 }
 
