@@ -1,0 +1,10 @@
+.
+├── Cargo.lock
+├── Cargo.toml
+├── Cargo2.toml
+├── src
+│   ├── main.rs
+│   └── main2.rs
+└── tree.txt
+
+2 directories, 6 files

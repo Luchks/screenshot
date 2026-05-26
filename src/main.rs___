@@ -15,10 +15,12 @@ struct Rect {
 }
 
 impl Rect {
+    #[allow(dead_code)]
     fn contains(&self, x: usize, y: usize) -> bool {
         x >= self.xmin && x <= self.xmax && y >= self.ymin && y <= self.ymax
     }
 
+    #[allow(dead_code)]
     fn expand(&self, margin: usize, max_w: usize, max_h: usize) -> Rect {
         Rect {
             xmin: self.xmin.saturating_sub(margin),
@@ -68,7 +70,8 @@ struct Selection {
     source_label: Option<u32>,
 }
 
-/// Snapshot del estado visible de un frame para evitar repintados innecesarios.
+/// Snapshot del estado visible de un frame. Se usa para detectar si el frame
+/// ha cambiado y así evitar repintados innecesarios.
 #[derive(Clone, Copy, PartialEq)]
 struct FrameState {
     cursor_x: usize,
@@ -136,12 +139,17 @@ fn main() {
         source_label: init_label,
     };
 
-    const SNAP_HYSTERESIS: usize = 8;
+    // Punto de anclaje para ManualVisual
     let mut visual_origin: Option<(usize, usize)> = None;
-    let mut last_input_time = Instant::now();
-    let mut v_key_pressed = false; // Flag para evitar el toggle infinito de la tecla 'v'
 
+    // Control de repetición de teclas
+    let mut last_input_time = Instant::now();
+
+    // Dirty rect acumulado: la región del framebuffer que toca el render actual
+    // Se restaura al comienzo del siguiente frame antes de redibujar.
     let mut dirty: Option<Rect> = None;
+
+    // Frame anterior: para omitir repintados cuando nada cambió
     let mut prev_frame: Option<FrameState> = None;
 
     // ── Loop principal ────────────────────────────────────────────────────────
@@ -156,18 +164,13 @@ fn main() {
             Duration::from_millis(16)
         };
 
-        // Rastrear estado de flanco de bajada/subida para la tecla V de forma limpia
-        if !window.is_key_down(Key::V) {
-            v_key_pressed = false;
-        }
-
         if now.duration_since(last_input_time) >= input_delay {
             let move_step = if shift { 25 } else { 3 };
             let resize_step = if shift { 20 } else { 5 };
             let mut acted = false;
 
             match sel.mode {
-                // ── AutoSnap ──────────────────────────────────────────────────
+                // ── AutoSnap: hjkl mueve el cursor; el rect sigue al CCL ──────
                 SelectionMode::AutoSnap => {
                     if window.is_key_down(Key::H) { cx = cx.saturating_sub(move_step); acted = true; }
                     if window.is_key_down(Key::L) { cx = (cx + move_step).min(w - 1);  acted = true; }
@@ -175,21 +178,19 @@ fn main() {
                     if window.is_key_down(Key::J) { cy = (cy + move_step).min(h - 1);  acted = true; }
 
                     if acted {
-                        // Aplicar histéresis espacial: solo re-evaluar si salimos del perímetro expandido
-                        if !sel.rect.expand(SNAP_HYSTERESIS, w, h).contains(cx, cy) {
-                            let (r, lbl) = snap_rect(cx, cy);
-                            sel.rect = r;
-                            sel.source_label = lbl;
-                        }
+                        let (r, lbl) = snap_rect(cx, cy);
+                        sel.rect = r;
+                        sel.source_label = lbl;
                     }
 
+                    // Transición → ManualResize
                     if window.is_key_down(Key::R) {
                         sel.mode = SelectionMode::ManualResize;
                         acted = true;
                     }
 
-                    if window.is_key_down(Key::V) && !v_key_pressed {
-                        v_key_pressed = true;
+                    // Transición → ManualVisual
+                    if window.is_key_down(Key::V) {
                         visual_origin = Some((cx, cy));
                         sel.mode = SelectionMode::ManualVisual;
                         sel.source_label = None;
@@ -197,40 +198,38 @@ fn main() {
                     }
                 }
 
-                // ── ManualResize ──────────────────────────────────────────────
+                // ── ManualResize: Shift+hjkl expande/contrae bordes ───────────
+                // hjkl sin Shift mueve el cursor (y por tanto reancla el resize)
                 SelectionMode::ManualResize => {
+                    // Mover cursor sin cambiar modo
                     if !shift {
                         if window.is_key_down(Key::H) { cx = cx.saturating_sub(move_step); acted = true; }
                         if window.is_key_down(Key::L) { cx = (cx + move_step).min(w - 1);  acted = true; }
                         if window.is_key_down(Key::K) { cy = cy.saturating_sub(move_step); acted = true; }
                         if window.is_key_down(Key::J) { cy = (cy + move_step).min(h - 1);  acted = true; }
+                    }
 
-                        // Restricción crítica: si el cursor abandona la caja modificada por el usuario, vuelve a AutoSnap
-                        if acted && !sel.rect.contains(cx, cy) {
-                            let (r, lbl) = snap_rect(cx, cy);
-                            sel = Selection { rect: r, mode: SelectionMode::AutoSnap, source_label: lbl };
-                        }
-                    } else {
+                    // Shift+hjkl: expande el lado correspondiente
+                    if shift {
                         let mut r = sel.rect;
                         if window.is_key_down(Key::H) { r.xmin = r.xmin.saturating_sub(resize_step); acted = true; }
                         if window.is_key_down(Key::L) { r.xmax = (r.xmax + resize_step).min(w - 1);  acted = true; }
                         if window.is_key_down(Key::K) { r.ymin = r.ymin.saturating_sub(resize_step); acted = true; }
                         if window.is_key_down(Key::J) { r.ymax = (r.ymax + resize_step).min(h - 1);  acted = true; }
-                        
-                        // Asegurar invariantes estructurales mínimos antes de asignar
-                        if r.xmin <= r.xmax && r.ymin <= r.ymax {
-                            sel.rect = r.clamp_to_screen(w, h);
-                        }
+                        sel.rect = r.clamp_to_screen(w, h);
                     }
 
-                    if window.is_key_down(Key::Key0) {
+                    // Volver a AutoSnap
+                    if window.is_key_down(Key::Key0) || window.is_key_down(Key::Escape) {
+                        // Escape solo sale si estamos en un sub-modo; en AutoSnap cierra
+                        // Aquí usamos Key::Key0 para resetear
                         let (r, lbl) = snap_rect(cx, cy);
                         sel = Selection { rect: r, mode: SelectionMode::AutoSnap, source_label: lbl };
                         acted = true;
                     }
                 }
 
-                // ── ManualVisual ──────────────────────────────────────────────
+                // ── ManualVisual: hjkl mueve el cursor; el rect crece desde origin ──
                 SelectionMode::ManualVisual => {
                     if window.is_key_down(Key::H) { cx = cx.saturating_sub(move_step); acted = true; }
                     if window.is_key_down(Key::L) { cx = (cx + move_step).min(w - 1);  acted = true; }
@@ -248,9 +247,8 @@ fn main() {
                         }
                     }
 
-                    // Salida limpia controlando el rebote de la tecla
-                    if window.is_key_down(Key::V) && !v_key_pressed {
-                        v_key_pressed = true;
+                    // Volver a AutoSnap ('v' de nuevo o Escape→AutoSnap)
+                    if window.is_key_down(Key::V) {
                         let (r, lbl) = snap_rect(cx, cy);
                         sel = Selection { rect: r, mode: SelectionMode::AutoSnap, source_label: lbl };
                         visual_origin = None;
@@ -273,7 +271,7 @@ fn main() {
             std::process::exit(0);
         }
 
-        // ── 3. Render (Fase puramente visual y Frame Skipping) ────────────────
+        // ── 3. Render (solo si el estado cambió) ──────────────────────────────
         let current_frame = FrameState {
             cursor_x: cx,
             cursor_y: cy,
@@ -282,14 +280,17 @@ fn main() {
         };
 
         if prev_frame.map_or(true, |pf| pf != current_frame) {
+            // 3a. Restaurar la región sucia del frame anterior
             if let Some(d) = dirty {
                 restore_bounding_box(&clean_buffer, &mut render_buffer, w, d);
             }
 
+            // 3b. Dibujar rect de selección + cursor
             let color = border_color(sel.mode);
             draw_rect_border(&mut render_buffer, w, h, sel.rect, color);
             draw_cross_cursor(&mut render_buffer, w, h, cx, cy, 0xFFFFFF);
 
+            // 3c. Calcular nuevo dirty rect (selección ∪ área del cursor)
             let cursor_area = Rect {
                 xmin: cx.saturating_sub(30),
                 ymin: cy.saturating_sub(30),
@@ -301,12 +302,13 @@ fn main() {
             window.update_with_buffer(&render_buffer, w, h).unwrap();
             prev_frame = Some(current_frame);
         } else {
+            // Sin cambios: actualizar la ventana sin tocar el buffer
             window.update_with_buffer(&render_buffer, w, h).unwrap();
         }
     }
 }
 
-// ─── Segmentación morfológica ─────────────────────────────────────────────────
+// ─── Segmentación morfológica (sin cambios) ───────────────────────────────────
 
 fn find(mut i: u32, parent: &mut [u32]) -> u32 {
     while parent[i as usize] != i {
@@ -407,6 +409,7 @@ fn segment_ui_structure(buf: &[u32], w: usize, h: usize) -> (Vec<u32>, Vec<Rect>
         }
     }
 
+    // Segundo pase: aplanar etiquetas y calcular bounding boxes
     let mut max_used_label = 0u32;
     for idx in 0..labels.len() {
         if labels[idx] > 0 {
@@ -441,6 +444,7 @@ fn segment_ui_structure(buf: &[u32], w: usize, h: usize) -> (Vec<u32>, Vec<Rect>
         }
     }
 
+    // Limpiar etiquetas de micro-bloques en el label_map
     for idx in 0..labels.len() {
         let l = labels[idx];
         if l > 0 {
@@ -516,9 +520,11 @@ fn save_and_copy_sturdy(clean_buffer: &[u32], w: usize, area: (usize, usize, usi
         image::ImageFormat::Png,
     ).expect("Error al codificar PNG");
 
-    // Lanzamos wl-copy de forma totalmente independiente
+    // wl-copy actúa como servidor de portapapeles y debe permanecer vivo
+    // hasta que algún cliente solicite el contenido (--paste-once lo cierra
+    // automáticamente tras el primer pegado).
     let mut child = Command::new("wl-copy")
-        .args(["--type", "image/png"])
+        .args(["--type", "image/png", "--paste-once"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -526,8 +532,11 @@ fn save_and_copy_sturdy(clean_buffer: &[u32], w: usize, area: (usize, usize, usi
         .expect("Error al lanzar wl-copy");
 
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&png_data);
+        stdin.write_all(&png_data).expect("Error al escribir PNG en wl-copy");
+        // stdin se dropea aquí → EOF → wl-copy sabe que los datos terminaron
     }
-    
-    // Dejamos que el proceso persista en el fondo del entorno Wayland sin bloquear nuestro hilo principal
+
+    // Esperamos a que el primer cliente pegue. wl-copy --paste-once
+    // se cierra solo; wait() bloquea hasta entonces sin consumir CPU.
+    child.wait().ok();
 }
