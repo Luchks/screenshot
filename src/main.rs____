@@ -37,7 +37,6 @@ impl Rect {
         }
     }
 
-    /// Bounding box mínimo que contiene dos rects.
     fn union_with(&self, other: Rect) -> Rect {
         Rect {
             xmin: self.xmin.min(other.xmin),
@@ -91,13 +90,9 @@ struct Hint {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SelectionMode {
-    /// Sigue automáticamente el bloque morfológico del CCL bajo el cursor.
     AutoSnap,
-    /// Congela el bloque actual; Shift+hjkl expande/contrae sus bordes.
     ManualResize,
-    /// Modo visual libre ('v'): expande el área desde un punto de origen fijo.
     ManualVisual,
-    /// Modo hint ('f'): muestra candidatos visualmente para selección futura.
     HintMode,
 }
 
@@ -105,11 +100,9 @@ enum SelectionMode {
 struct Selection {
     rect: Rect,
     mode: SelectionMode,
-    /// Etiqueta CCL del bloque que originó la selección (None en ManualVisual).
     source_label: Option<u32>,
 }
 
-/// Snapshot del estado visible de un frame para evitar repintados innecesarios.
 #[derive(Clone, Copy, PartialEq)]
 struct FrameState {
     cursor_x: usize,
@@ -122,17 +115,16 @@ struct FrameState {
 
 fn border_color(mode: SelectionMode) -> u32 {
     match mode {
-        SelectionMode::AutoSnap     => 0x00AAFF, // azul cian
-        SelectionMode::ManualResize => 0xFF8800, // naranja
-        SelectionMode::ManualVisual => 0x00FF88, // verde menta
-        SelectionMode::HintMode     => 0x00AAFF, // igual que AutoSnap; el sel no se dibuja en HintMode
+        SelectionMode::AutoSnap     => 0x00AAFF,
+        SelectionMode::ManualResize => 0xFF8800,
+        SelectionMode::ManualVisual => 0x00FF88,
+        SelectionMode::HintMode     => 0x00AAFF,
     }
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
-    // Captura inicial
     Command::new("grim").arg("/tmp/screenshot.png").output().unwrap();
     let img = image::open("/tmp/screenshot.png").expect("Error al abrir captura");
     let (width, height) = img.dimensions();
@@ -148,7 +140,6 @@ fn main() {
     let (label_map, blocks) = segment_ui_structure(&clean_buffer, w, h);
     println!("Se detectaron {} bloques visuales independientes.", blocks.len());
 
-    // Helper: rect CCL bajo un punto, o fallback puntual 1x1
     let snap_rect = |cx: usize, cy: usize| -> (Rect, Option<u32>) {
         let lbl = label_map[cy * w + cx];
         if lbl > 0 && (lbl as usize) <= blocks.len() {
@@ -158,7 +149,6 @@ fn main() {
         }
     };
 
-    // Estado de ventana
     let mut options = WindowOptions::default();
     options.borderless = true;
     options.title = false;
@@ -168,7 +158,6 @@ fn main() {
         .expect("Error al abrir la ventana");
     window.set_target_fps(60);
 
-    // ── Estado inicial ────────────────────────────────────────────────────────
     let (mut cx, mut cy) = (w / 2, h / 2);
     let (init_rect, init_label) = snap_rect(cx, cy);
 
@@ -181,30 +170,26 @@ fn main() {
     const SNAP_HYSTERESIS: usize = 8;
     let mut visual_origin: Option<(usize, usize)> = None;
     let mut last_input_time = Instant::now();
-    let mut v_key_pressed = false; // Flag para evitar el toggle infinito de la tecla 'v'
-    let mut f_key_pressed = false; // Flag para evitar el toggle infinito de la tecla 'f'
+    let mut v_key_pressed = false;
+    let mut f_key_pressed = false;
+    let mut hint_key_pressed: Option<Key> = None;
 
     let mut dirty: Option<Rect> = None;
     let mut prev_frame: Option<FrameState> = None;
 
-    // ── Estado HintMode ───────────────────────────────────────────────────────
     let mut active_candidates: Vec<Candidate> = Vec::new();
     let mut active_hints: Vec<Hint> = Vec::new();
 
-    // ── Loop principal ────────────────────────────────────────────────────────
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
-
-        // ── 1. INPUT con debounce adaptativo ──────────────────────────────────
         let shift = window.is_key_down(Key::LeftShift);
-        let input_delay = if shift {
-            Duration::from_millis(4)
-        } else {
-            Duration::from_millis(16)
-        };
+        let input_delay = if shift { Duration::from_millis(4) } else { Duration::from_millis(16) };
 
         if !window.is_key_down(Key::V) { v_key_pressed = false; }
         if !window.is_key_down(Key::F) { f_key_pressed = false; }
+        if let Some(hk) = hint_key_pressed {
+            if !window.is_key_down(hk) { hint_key_pressed = None; }
+        }
 
         if now.duration_since(last_input_time) >= input_delay {
             let move_step = if shift { 25 } else { 3 };
@@ -226,10 +211,7 @@ fn main() {
                         }
                     }
 
-                    if window.is_key_down(Key::R) {
-                        sel.mode = SelectionMode::ManualResize;
-                        acted = true;
-                    }
+                    if window.is_key_down(Key::R) { sel.mode = SelectionMode::ManualResize; acted = true; }
 
                     if window.is_key_down(Key::V) && !v_key_pressed {
                         v_key_pressed = true;
@@ -314,6 +296,25 @@ fn main() {
                         sel = Selection { rect: r, mode: SelectionMode::AutoSnap, source_label: lbl };
                         acted = true;
                     }
+
+                    if hint_key_pressed.is_none() {
+                        for &hk in HINT_KEYS {
+                            if window.is_key_down(hk) {
+                                hint_key_pressed = Some(hk);
+                                if let Some(candidate_index) = find_hint_by_key(&active_hints, hk) {
+                                    let candidate = &active_candidates[candidate_index];
+                                    let rect = &blocks[candidate.id.0];
+                                    println!("----------------------------------------");
+                                    println!("Hint:      {}", key_to_char(hk).unwrap());
+                                    println!("Candidate: {}", candidate_index);
+                                    println!("Rect:      {} {} {} {}", rect.xmin, rect.ymin, rect.xmax, rect.ymax);
+                                    println!("Score:     {:.3}", candidate.total_score);
+                                    println!("----------------------------------------");
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -344,6 +345,7 @@ fn main() {
 
             if sel.mode == SelectionMode::HintMode {
                 let hint_dirty = draw_hint_borders(&mut render_buffer, w, h, &active_candidates, &blocks);
+                draw_hints(&mut render_buffer, w, h, &active_hints, &active_candidates);
                 draw_cross_cursor(&mut render_buffer, w, h, cx, cy, 0xFFFFFF);
 
                 let cursor_area = Rect {
@@ -531,6 +533,32 @@ const HINT_MIN_AREA: usize       = 400;
 const HINT_MIN_DIMENSION: usize  = 8;
 const HINT_MAX_ASPECT_RATIO: f32 = 20.0;
 
+const HINT_KEYS: &[Key] = &[
+    Key::A, Key::S, Key::D, Key::F, Key::G, Key::H, Key::J, Key::K, Key::L,
+    Key::Q, Key::W, Key::E, Key::R, Key::T, Key::Y, Key::U, Key::I, Key::O, Key::P,
+    Key::Z, Key::X, Key::C, Key::V, Key::B, Key::N, Key::M,
+];
+
+fn key_to_char(key: Key) -> Option<char> {
+    match key {
+        Key::A => Some('A'), Key::B => Some('B'), Key::C => Some('C'),
+        Key::D => Some('D'), Key::E => Some('E'), Key::F => Some('F'),
+        Key::G => Some('G'), Key::H => Some('H'), Key::I => Some('I'),
+        Key::J => Some('J'), Key::K => Some('K'), Key::L => Some('L'),
+        Key::M => Some('M'), Key::N => Some('N'), Key::O => Some('O'),
+        Key::P => Some('P'), Key::Q => Some('Q'), Key::R => Some('R'),
+        Key::S => Some('S'), Key::T => Some('T'), Key::U => Some('U'),
+        Key::V => Some('V'), Key::W => Some('W'), Key::X => Some('X'),
+        Key::Y => Some('Y'), Key::Z => Some('Z'),
+        _ => None,
+    }
+}
+
+fn find_hint_by_key(hints: &[Hint], key: Key) -> Option<usize> {
+    let ch = key_to_char(key)?;
+    hints.iter().find(|h| h.label == ch).map(|h| h.candidate_index)
+}
+
 fn filter_noise(blocks: &[Rect], _screen_width: usize, _screen_height: usize) -> Vec<usize> {
     blocks.iter().enumerate().filter_map(|(i, r)| {
         if r.xmax < r.xmin || r.ymax < r.ymin { return None; }
@@ -595,6 +623,96 @@ fn generate_hints(candidates: &[Candidate]) -> Vec<Hint> {
             candidate_index: i,
         })
         .collect()
+}
+
+// ─── Fuente bitmap 5×7 para HintMode ─────────────────────────────────────────
+
+const FONT_5X7: &[(char, [u8; 7])] = &[
+    ('A', [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
+    ('B', [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110]),
+    ('C', [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110]),
+    ('D', [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110]),
+    ('E', [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111]),
+    ('F', [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000]),
+    ('G', [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111]),
+    ('H', [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
+    ('I', [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
+    ('J', [0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100]),
+    ('K', [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001]),
+    ('L', [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111]),
+    ('M', [0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0b10001, 0b10001]),
+    ('N', [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001]),
+    ('O', [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
+    ('P', [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000]),
+    ('Q', [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101]),
+    ('R', [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001]),
+    ('S', [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110]),
+    ('T', [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]),
+    ('U', [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
+    ('V', [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100]),
+    ('W', [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001]),
+    ('X', [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001]),
+    ('Y', [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100]),
+    ('Z', [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111]),
+];
+
+const GLYPH_W: usize = 5;
+const GLYPH_H: usize = 7;
+const HINT_MARGIN: usize = 2;
+const LABEL_W: usize = GLYPH_W + HINT_MARGIN * 2;
+const LABEL_H: usize = GLYPH_H + HINT_MARGIN * 2;
+const HINT_BG_COLOR:   u32 = 0x000000;
+const HINT_TEXT_COLOR: u32 = 0xFFFF00;
+
+fn glyph_row(ch: char, row: usize) -> u8 {
+    for &(c, ref bitmap) in FONT_5X7 {
+        if c == ch { return bitmap[row]; }
+    }
+    0
+}
+
+fn draw_hints(
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    hints: &[Hint],
+    candidates: &[Candidate],
+) {
+    const MAX_HINTS: usize = 10;
+    for hint in hints.iter().take(MAX_HINTS) {
+        let candidate = &candidates[hint.candidate_index];
+        let cx = candidate.center_x;
+        let cy = candidate.center_y;
+
+        let box_x = cx.saturating_sub(LABEL_W / 2);
+        let box_y = cy.saturating_sub(LABEL_H / 2);
+
+        let box_x2 = (box_x + LABEL_W).min(w);
+        let box_y2 = (box_y + LABEL_H).min(h);
+
+        for py in box_y..box_y2 {
+            for px in box_x..box_x2 {
+                buf[py * w + px] = HINT_BG_COLOR;
+            }
+        }
+
+        let glyph_x0 = box_x + HINT_MARGIN;
+        let glyph_y0 = box_y + HINT_MARGIN;
+
+        for row in 0..GLYPH_H {
+            let bits = glyph_row(hint.label, row);
+            let py = glyph_y0 + row;
+            if py >= h { break; }
+            for col in 0..GLYPH_W {
+                if (bits >> (GLYPH_W - 1 - col)) & 1 == 1 {
+                    let px = glyph_x0 + col;
+                    if px < w {
+                        buf[py * w + px] = HINT_TEXT_COLOR;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ─── Render auxiliar ──────────────────────────────────────────────────────────

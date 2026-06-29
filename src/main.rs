@@ -37,7 +37,6 @@ impl Rect {
         }
     }
 
-    /// Bounding box mínimo que contiene dos rects.
     fn union_with(&self, other: Rect) -> Rect {
         Rect {
             xmin: self.xmin.min(other.xmin),
@@ -48,27 +47,62 @@ impl Rect {
     }
 }
 
+// ─── HintMode: modelo de datos ────────────────────────────────────────────────
+
+struct CandidateId(usize);
+
+struct CandidateMetrics {
+    area: f32,
+    distance: f32,
+    aspect_ratio: f32,
+}
+
+struct CandidateWeights {
+    area: f32,
+    distance: f32,
+    aspect_ratio: f32,
+}
+
+impl Default for CandidateWeights {
+    fn default() -> Self {
+        CandidateWeights {
+            area:         0.4,
+            distance:     0.4,
+            aspect_ratio: 0.2,
+        }
+    }
+}
+
+struct Candidate {
+    id:          CandidateId,
+    center_x:    usize,
+    center_y:    usize,
+    metrics:     CandidateMetrics,
+    total_score: f32,
+}
+
+struct Hint {
+    label:           String,
+    candidate_index: usize,
+}
+
 // ─── Máquina de estados ───────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SelectionMode {
-    /// Sigue automáticamente el bloque morfológico del CCL bajo el cursor.
     AutoSnap,
-    /// Congela el bloque actual; Shift+hjkl expande/contrae sus bordes.
     ManualResize,
-    /// Modo visual libre ('v'): expande el área desde un punto de origen fijo.
     ManualVisual,
+    HintMode,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Selection {
     rect: Rect,
     mode: SelectionMode,
-    /// Etiqueta CCL del bloque que originó la selección (None en ManualVisual).
     source_label: Option<u32>,
 }
 
-/// Snapshot del estado visible de un frame para evitar repintados innecesarios.
 #[derive(Clone, Copy, PartialEq)]
 struct FrameState {
     cursor_x: usize,
@@ -81,16 +115,16 @@ struct FrameState {
 
 fn border_color(mode: SelectionMode) -> u32 {
     match mode {
-        SelectionMode::AutoSnap     => 0x00AAFF, // azul cian
-        SelectionMode::ManualResize => 0xFF8800, // naranja
-        SelectionMode::ManualVisual => 0x00FF88, // verde menta
+        SelectionMode::AutoSnap     => 0x00AAFF,
+        SelectionMode::ManualResize => 0xFF8800,
+        SelectionMode::ManualVisual => 0x00FF88,
+        SelectionMode::HintMode     => 0x00AAFF,
     }
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
-    // Captura inicial
     Command::new("grim").arg("/tmp/screenshot.png").output().unwrap();
     let img = image::open("/tmp/screenshot.png").expect("Error al abrir captura");
     let (width, height) = img.dimensions();
@@ -106,7 +140,6 @@ fn main() {
     let (label_map, blocks) = segment_ui_structure(&clean_buffer, w, h);
     println!("Se detectaron {} bloques visuales independientes.", blocks.len());
 
-    // Helper: rect CCL bajo un punto, o fallback puntual 1x1
     let snap_rect = |cx: usize, cy: usize| -> (Rect, Option<u32>) {
         let lbl = label_map[cy * w + cx];
         if lbl > 0 && (lbl as usize) <= blocks.len() {
@@ -116,7 +149,6 @@ fn main() {
         }
     };
 
-    // Estado de ventana
     let mut options = WindowOptions::default();
     options.borderless = true;
     options.title = false;
@@ -126,7 +158,6 @@ fn main() {
         .expect("Error al abrir la ventana");
     window.set_target_fps(60);
 
-    // ── Estado inicial ────────────────────────────────────────────────────────
     let (mut cx, mut cy) = (w / 2, h / 2);
     let (init_rect, init_label) = snap_rect(cx, cy);
 
@@ -139,26 +170,26 @@ fn main() {
     const SNAP_HYSTERESIS: usize = 8;
     let mut visual_origin: Option<(usize, usize)> = None;
     let mut last_input_time = Instant::now();
-    let mut v_key_pressed = false; // Flag para evitar el toggle infinito de la tecla 'v'
+    let mut v_key_pressed = false;
+    let mut f_key_pressed = false;
+    let mut hint_key_pressed: Option<Key> = None;
 
     let mut dirty: Option<Rect> = None;
     let mut prev_frame: Option<FrameState> = None;
 
-    // ── Loop principal ────────────────────────────────────────────────────────
+    let mut active_candidates: Vec<Candidate> = Vec::new();
+    let mut active_hints: Vec<Hint> = Vec::new();
+    let mut hint_prefix: Option<char> = None;
+
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now = Instant::now();
-
-        // ── 1. INPUT con debounce adaptativo ──────────────────────────────────
         let shift = window.is_key_down(Key::LeftShift);
-        let input_delay = if shift {
-            Duration::from_millis(4)
-        } else {
-            Duration::from_millis(16)
-        };
+        let input_delay = if shift { Duration::from_millis(4) } else { Duration::from_millis(16) };
 
-        // Rastrear estado de flanco de bajada/subida para la tecla V de forma limpia
-        if !window.is_key_down(Key::V) {
-            v_key_pressed = false;
+        if !window.is_key_down(Key::V) { v_key_pressed = false; }
+        if !window.is_key_down(Key::F) { f_key_pressed = false; }
+        if let Some(hk) = hint_key_pressed {
+            if !window.is_key_down(hk) { hint_key_pressed = None; }
         }
 
         if now.duration_since(last_input_time) >= input_delay {
@@ -167,7 +198,6 @@ fn main() {
             let mut acted = false;
 
             match sel.mode {
-                // ── AutoSnap ──────────────────────────────────────────────────
                 SelectionMode::AutoSnap => {
                     if window.is_key_down(Key::H) { cx = cx.saturating_sub(move_step); acted = true; }
                     if window.is_key_down(Key::L) { cx = (cx + move_step).min(w - 1);  acted = true; }
@@ -175,7 +205,6 @@ fn main() {
                     if window.is_key_down(Key::J) { cy = (cy + move_step).min(h - 1);  acted = true; }
 
                     if acted {
-                        // Aplicar histéresis espacial: solo re-evaluar si salimos del perímetro expandido
                         if !sel.rect.expand(SNAP_HYSTERESIS, w, h).contains(cx, cy) {
                             let (r, lbl) = snap_rect(cx, cy);
                             sel.rect = r;
@@ -183,10 +212,7 @@ fn main() {
                         }
                     }
 
-                    if window.is_key_down(Key::R) {
-                        sel.mode = SelectionMode::ManualResize;
-                        acted = true;
-                    }
+                    if window.is_key_down(Key::R) { sel.mode = SelectionMode::ManualResize; acted = true; }
 
                     if window.is_key_down(Key::V) && !v_key_pressed {
                         v_key_pressed = true;
@@ -195,9 +221,17 @@ fn main() {
                         sel.source_label = None;
                         acted = true;
                     }
+
+                    if window.is_key_down(Key::F) && !f_key_pressed {
+                        f_key_pressed = true;
+                        let valid = filter_noise(&blocks, w, h);
+                        active_candidates = rank_candidates(&valid, &blocks, cx, cy);
+                        active_hints = generate_hints(&active_candidates);
+                        sel.mode = SelectionMode::HintMode;
+                        acted = true;
+                    }
                 }
 
-                // ── ManualResize ──────────────────────────────────────────────
                 SelectionMode::ManualResize => {
                     if !shift {
                         if window.is_key_down(Key::H) { cx = cx.saturating_sub(move_step); acted = true; }
@@ -205,7 +239,6 @@ fn main() {
                         if window.is_key_down(Key::K) { cy = cy.saturating_sub(move_step); acted = true; }
                         if window.is_key_down(Key::J) { cy = (cy + move_step).min(h - 1);  acted = true; }
 
-                        // Restricción crítica: si el cursor abandona la caja modificada por el usuario, vuelve a AutoSnap
                         if acted && !sel.rect.contains(cx, cy) {
                             let (r, lbl) = snap_rect(cx, cy);
                             sel = Selection { rect: r, mode: SelectionMode::AutoSnap, source_label: lbl };
@@ -216,8 +249,7 @@ fn main() {
                         if window.is_key_down(Key::L) { r.xmax = (r.xmax + resize_step).min(w - 1);  acted = true; }
                         if window.is_key_down(Key::K) { r.ymin = r.ymin.saturating_sub(resize_step); acted = true; }
                         if window.is_key_down(Key::J) { r.ymax = (r.ymax + resize_step).min(h - 1);  acted = true; }
-                        
-                        // Asegurar invariantes estructurales mínimos antes de asignar
+
                         if r.xmin <= r.xmax && r.ymin <= r.ymax {
                             sel.rect = r.clamp_to_screen(w, h);
                         }
@@ -230,7 +262,6 @@ fn main() {
                     }
                 }
 
-                // ── ManualVisual ──────────────────────────────────────────────
                 SelectionMode::ManualVisual => {
                     if window.is_key_down(Key::H) { cx = cx.saturating_sub(move_step); acted = true; }
                     if window.is_key_down(Key::L) { cx = (cx + move_step).min(w - 1);  acted = true; }
@@ -248,7 +279,6 @@ fn main() {
                         }
                     }
 
-                    // Salida limpia controlando el rebote de la tecla
                     if window.is_key_down(Key::V) && !v_key_pressed {
                         v_key_pressed = true;
                         let (r, lbl) = snap_rect(cx, cy);
@@ -257,12 +287,60 @@ fn main() {
                         acted = true;
                     }
                 }
+
+                SelectionMode::HintMode => {
+                    if window.is_key_down(Key::F) && !f_key_pressed {
+                        f_key_pressed = true;
+                        active_candidates.clear();
+                        active_hints.clear();
+                        hint_prefix = None;
+                        let (r, lbl) = snap_rect(cx, cy);
+                        sel = Selection { rect: r, mode: SelectionMode::AutoSnap, source_label: lbl };
+                        acted = true;
+                    }
+
+                    if hint_key_pressed.is_none() {
+                        for &hk in HINT_KEYS {
+                            if window.is_key_down(hk) {
+                                hint_key_pressed = Some(hk);
+                                if let Some(ch) = key_to_char(hk) {
+                                    match hint_prefix {
+                                        None => {
+                                            // Primera tecla: guardar prefijo
+                                            hint_prefix = Some(ch);
+                                        }
+                                        Some(first) => {
+                                            // Segunda tecla: resolver label completo
+                                            let label = format!("{}{}", first, ch);
+                                            if let Some(candidate_index) = find_hint_by_label(&active_hints, &label) {
+                                                let candidate = &active_candidates[candidate_index];
+                                                let rect = &blocks[candidate.id.0];
+                                                cx = (rect.xmin + rect.xmax) / 2;
+                                                cy = (rect.ymin + rect.ymax) / 2;
+                                                let (snapped, lbl) = snap_rect(cx, cy);
+                                                sel = Selection {
+                                                    rect: snapped,
+                                                    mode: SelectionMode::AutoSnap,
+                                                    source_label: lbl,
+                                                };
+                                                active_candidates.clear();
+                                                active_hints.clear();
+                                            }
+                                            hint_prefix = None;
+                                        }
+                                    }
+                                }
+                                acted = true;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
             if acted { last_input_time = now; }
         }
 
-        // ── 2. Confirmar captura con Enter ────────────────────────────────────
         if window.is_key_down(Key::Enter) {
             let capture_rect = sel.rect.clamp_to_screen(w, h);
             drop(window);
@@ -273,7 +351,6 @@ fn main() {
             std::process::exit(0);
         }
 
-        // ── 3. Render (Fase puramente visual y Frame Skipping) ────────────────
         let current_frame = FrameState {
             cursor_x: cx,
             cursor_y: cy,
@@ -286,17 +363,35 @@ fn main() {
                 restore_bounding_box(&clean_buffer, &mut render_buffer, w, d);
             }
 
-            let color = border_color(sel.mode);
-            draw_rect_border(&mut render_buffer, w, h, sel.rect, color);
-            draw_cross_cursor(&mut render_buffer, w, h, cx, cy, 0xFFFFFF);
+            if sel.mode == SelectionMode::HintMode {
+                let hint_dirty = draw_hint_borders(&mut render_buffer, w, h, &active_candidates, &blocks);
+                draw_hints(&mut render_buffer, w, h, &active_hints, &active_candidates);
+                draw_cross_cursor(&mut render_buffer, w, h, cx, cy, 0xFFFFFF);
 
-            let cursor_area = Rect {
-                xmin: cx.saturating_sub(30),
-                ymin: cy.saturating_sub(30),
-                xmax: (cx + 30).min(w - 1),
-                ymax: (cy + 30).min(h - 1),
-            };
-            dirty = Some(sel.rect.union_with(cursor_area));
+                let cursor_area = Rect {
+                    xmin: cx.saturating_sub(30),
+                    ymin: cy.saturating_sub(30),
+                    xmax: (cx + 30).min(w - 1),
+                    ymax: (cy + 30).min(h - 1),
+                };
+
+                dirty = Some(match hint_dirty {
+                    Some(hd) => hd.union_with(cursor_area),
+                    None     => cursor_area,
+                });
+            } else {
+                let color = border_color(sel.mode);
+                draw_rect_border(&mut render_buffer, w, h, sel.rect, color);
+                draw_cross_cursor(&mut render_buffer, w, h, cx, cy, 0xFFFFFF);
+
+                let cursor_area = Rect {
+                    xmin: cx.saturating_sub(30),
+                    ymin: cy.saturating_sub(30),
+                    xmax: (cx + 30).min(w - 1),
+                    ymax: (cy + 30).min(h - 1),
+                };
+                dirty = Some(sel.rect.union_with(cursor_area));
+            }
 
             window.update_with_buffer(&render_buffer, w, h).unwrap();
             prev_frame = Some(current_frame);
@@ -326,7 +421,6 @@ fn union(i: u32, j: u32, parent: &mut [u32]) {
 
 fn segment_ui_structure(buf: &[u32], w: usize, h: usize) -> (Vec<u32>, Vec<Rect>) {
     let mut binary_mask = vec![false; buf.len()];
-
     for y in 1..(h - 1) {
         for x in 1..(w - 1) {
             let idx = y * w + x;
@@ -450,8 +544,203 @@ fn segment_ui_structure(buf: &[u32], w: usize, h: usize) -> (Vec<u32>, Vec<Rect>
             if too_small { labels[idx] = 0; }
         }
     }
-
     (labels, rects)
+}
+
+// ─── HintMode: pipeline de datos (sin dependencias de renderizado) ────────────
+
+const HINT_MIN_AREA: usize       = 400;
+const HINT_MIN_DIMENSION: usize  = 8;
+const HINT_MAX_ASPECT_RATIO: f32 = 20.0;
+
+const HINT_KEYS: &[Key] = &[
+    Key::A, Key::S, Key::D, Key::G, Key::H, Key::J, Key::K, Key::L,
+    Key::Q, Key::W, Key::E, Key::R, Key::T, Key::Y, Key::U, Key::I, Key::O, Key::P,
+    Key::Z, Key::X, Key::C, Key::V, Key::B, Key::N, Key::M,
+];
+
+fn key_to_char(key: Key) -> Option<char> {
+    match key {
+        Key::A => Some('A'), Key::B => Some('B'), Key::C => Some('C'),
+        Key::D => Some('D'), Key::E => Some('E'),
+        Key::G => Some('G'), Key::H => Some('H'), Key::I => Some('I'),
+        Key::J => Some('J'), Key::K => Some('K'), Key::L => Some('L'),
+        Key::M => Some('M'), Key::N => Some('N'), Key::O => Some('O'),
+        Key::P => Some('P'), Key::Q => Some('Q'), Key::R => Some('R'),
+        Key::S => Some('S'), Key::T => Some('T'), Key::U => Some('U'),
+        Key::V => Some('V'), Key::W => Some('W'), Key::X => Some('X'),
+        Key::Y => Some('Y'), Key::Z => Some('Z'),
+        _ => None,
+    }
+}
+
+fn find_hint_by_label(hints: &[Hint], label: &str) -> Option<usize> {
+    hints.iter().find(|h| h.label == label).map(|h| h.candidate_index)
+}
+
+fn filter_noise(blocks: &[Rect], _screen_width: usize, _screen_height: usize) -> Vec<usize> {
+    blocks.iter().enumerate().filter_map(|(i, r)| {
+        if r.xmax < r.xmin || r.ymax < r.ymin { return None; }
+        let bw = r.xmax - r.xmin + 1;
+        let bh = r.ymax - r.ymin + 1;
+        let area = bw * bh;
+        if area < HINT_MIN_AREA || bw < HINT_MIN_DIMENSION || bh < HINT_MIN_DIMENSION { return None; }
+        let aspect = (bw as f32 / bh as f32).max(bh as f32 / bw as f32);
+        if aspect > HINT_MAX_ASPECT_RATIO { return None; }
+        Some(i)
+    }).collect()
+}
+
+fn rank_candidates(valid_indices: &[usize], blocks: &[Rect], cursor_x: usize, cursor_y: usize) -> Vec<Candidate> {
+    if valid_indices.is_empty() { return Vec::new(); }
+    let weights = CandidateWeights::default();
+    let max_area: f32 = valid_indices.iter().map(|&i| {
+        let r = &blocks[i]; ((r.xmax - r.xmin + 1) * (r.ymax - r.ymin + 1)) as f32
+    }).fold(1.0_f32, f32::max);
+    let max_dist: f32 = valid_indices.iter().map(|&i| {
+        let r = &blocks[i];
+        let cx = (r.xmin + r.xmax) / 2;
+        let cy = (r.ymin + r.ymax) / 2;
+        let dx = cx as f32 - cursor_x as f32;
+        let dy = cy as f32 - cursor_y as f32;
+        (dx * dx + dy * dy).sqrt()
+    }).fold(1.0_f32, f32::max);
+
+    let max_aspect: f32 = HINT_MAX_ASPECT_RATIO;
+    let mut candidates: Vec<Candidate> = valid_indices.iter().map(|&i| {
+        let r = &blocks[i];
+        let bw = (r.xmax - r.xmin + 1) as f32;
+        let bh = (r.ymax - r.ymin + 1) as f32;
+        let center_x = (r.xmin + r.xmax) / 2;
+        let center_y = (r.ymin + r.ymax) / 2;
+        let dx = center_x as f32 - cursor_x as f32;
+        let dy = center_y as f32 - cursor_y as f32;
+        let dist = (dx * dx + dy * dy).sqrt();
+        let area_norm   = (bw * bh) / max_area;
+        let dist_norm   = 1.0 - (dist / max_dist);
+        let aspect      = (bw / bh).max(bh / bw);
+        let aspect_norm = 1.0 - ((aspect - 1.0) / (max_aspect - 1.0)).min(1.0);
+        let metrics = CandidateMetrics { area: area_norm, distance: dist_norm, aspect_ratio: aspect_norm };
+        let total_score = metrics.area * weights.area + metrics.distance * weights.distance + metrics.aspect_ratio * weights.aspect_ratio;
+        Candidate { id: CandidateId(i), center_x, center_y, metrics, total_score }
+    }).collect();
+    candidates.sort_by(|a, b| b.total_score.partial_cmp(&a.total_score).unwrap_or(std::cmp::Ordering::Equal));
+    candidates
+}
+
+fn generate_hints(candidates: &[Candidate]) -> Vec<Hint> {
+    const HINT_LABELS: &[char] = &[
+        'A','S','D','G','H','J','K','L',
+        'Q','W','E','R','T','Y','U','I','O','P',
+        'Z','X','C','V','B','N','M',
+    ];
+    let labels: Vec<String> = HINT_LABELS.iter()
+        .flat_map(|&a| HINT_LABELS.iter().map(move |&b| format!("{}{}", a, b)))
+        .collect();
+    candidates.iter()
+        .enumerate()
+        .take(labels.len())
+        .map(|(i, _)| Hint {
+            label:           labels[i].clone(),
+            candidate_index: i,
+        })
+        .collect()
+}
+
+// ─── Fuente bitmap 5×7 para HintMode ─────────────────────────────────────────
+
+const FONT_5X7: &[(char, [u8; 7])] = &[
+    ('A', [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
+    ('B', [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110]),
+    ('C', [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110]),
+    ('D', [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110]),
+    ('E', [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111]),
+    ('F', [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000]),
+    ('G', [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111]),
+    ('H', [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001]),
+    ('I', [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110]),
+    ('J', [0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100]),
+    ('K', [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001]),
+    ('L', [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111]),
+    ('M', [0b10001, 0b11011, 0b10101, 0b10001, 0b10001, 0b10001, 0b10001]),
+    ('N', [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001]),
+    ('O', [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
+    ('P', [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000]),
+    ('Q', [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101]),
+    ('R', [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001]),
+    ('S', [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110]),
+    ('T', [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100]),
+    ('U', [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110]),
+    ('V', [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100]),
+    ('W', [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001]),
+    ('X', [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001]),
+    ('Y', [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100]),
+    ('Z', [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111]),
+];
+
+const GLYPH_W: usize = 5;
+const GLYPH_H: usize = 7;
+const HINT_MARGIN: usize = 2;
+const LABEL_W: usize = GLYPH_W + HINT_MARGIN * 2;
+const LABEL_H: usize = GLYPH_H + HINT_MARGIN * 2;
+const HINT_BG_COLOR:   u32 = 0x000000;
+const HINT_TEXT_COLOR: u32 = 0xFFFF00;
+
+fn glyph_row(ch: char, row: usize) -> u8 {
+    for &(c, ref bitmap) in FONT_5X7 {
+        if c == ch { return bitmap[row]; }
+    }
+    0
+}
+
+const GLYPH_GAP: usize = 1;
+const LABEL2_W: usize = GLYPH_W * 2 + GLYPH_GAP + HINT_MARGIN * 2;
+
+fn draw_hints(
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    hints: &[Hint],
+    candidates: &[Candidate],
+) {
+    const MAX_HINTS: usize = 10;
+    for hint in hints.iter().take(MAX_HINTS) {
+        let candidate = &candidates[hint.candidate_index];
+        let cx = candidate.center_x;
+        let cy = candidate.center_y;
+
+        let box_x = cx.saturating_sub(LABEL2_W / 2);
+        let box_y = cy.saturating_sub(LABEL_H / 2);
+
+        let box_x2 = (box_x + LABEL2_W).min(w);
+        let box_y2 = (box_y + LABEL_H).min(h);
+
+        for py in box_y..box_y2 {
+            for px in box_x..box_x2 {
+                buf[py * w + px] = HINT_BG_COLOR;
+            }
+        }
+
+        let glyph_y0 = box_y + HINT_MARGIN;
+        let chars: Vec<char> = hint.label.chars().collect();
+
+        for (gi, &ch) in chars.iter().enumerate() {
+            let glyph_x0 = box_x + HINT_MARGIN + gi * (GLYPH_W + GLYPH_GAP);
+            for row in 0..GLYPH_H {
+                let bits = glyph_row(ch, row);
+                let py = glyph_y0 + row;
+                if py >= h { break; }
+                for col in 0..GLYPH_W {
+                    if (bits >> (GLYPH_W - 1 - col)) & 1 == 1 {
+                        let px = glyph_x0 + col;
+                        if px < w {
+                            buf[py * w + px] = HINT_TEXT_COLOR;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ─── Render auxiliar ──────────────────────────────────────────────────────────
@@ -460,9 +749,7 @@ fn restore_bounding_box(src: &[u32], dest: &mut [u32], w: usize, rect: Rect) {
     for row in rect.ymin..=rect.ymax {
         let start = row * w + rect.xmin;
         let end   = row * w + rect.xmax + 1;
-        if end <= src.len() {
-            dest[start..end].copy_from_slice(&src[start..end]);
-        }
+        if end <= src.len() { dest[start..end].copy_from_slice(&src[start..end]); }
     }
 }
 
@@ -488,6 +775,21 @@ fn draw_cross_cursor(buf: &mut [u32], w: usize, h: usize, cx: usize, cy: usize, 
         if nx >= 0 && nx < w as i32 { buf[cy * w + nx as usize] = color; }
         if ny >= 0 && ny < h as i32 { buf[ny as usize * w + cx]  = color; }
     }
+}
+
+fn draw_hint_borders(buf: &mut [u32], w: usize, h: usize, candidates: &[Candidate], blocks: &[Rect]) -> Option<Rect> {
+    const HINT_COLOR: u32   = 0x444444;
+    const MAX_HINTS: usize  = 10;
+    let mut bounding: Option<Rect> = None;
+    for candidate in candidates.iter().take(MAX_HINTS) {
+        let rect = blocks[candidate.id.0].clamp_to_screen(w, h);
+        draw_rect_border(buf, w, h, rect, HINT_COLOR);
+        bounding = Some(match bounding {
+            Some(b) => b.union_with(rect),
+            None    => rect,
+        });
+    }
+    bounding
 }
 
 // ─── Captura y copia al portapapeles ──────────────────────────────────────────
@@ -516,7 +818,6 @@ fn save_and_copy_sturdy(clean_buffer: &[u32], w: usize, area: (usize, usize, usi
         image::ImageFormat::Png,
     ).expect("Error al codificar PNG");
 
-    // Lanzamos wl-copy de forma totalmente independiente
     let mut child = Command::new("wl-copy")
         .args(["--type", "image/png"])
         .stdin(Stdio::piped())
@@ -528,6 +829,4 @@ fn save_and_copy_sturdy(clean_buffer: &[u32], w: usize, area: (usize, usize, usi
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(&png_data);
     }
-    
-    // Dejamos que el proceso persista en el fondo del entorno Wayland sin bloquear nuestro hilo principal
 }
