@@ -4,6 +4,15 @@ use std::io::Write;
 use std::time::{Instant, Duration};
 use image::{GenericImageView, RgbaImage};
 
+// ─── Módulos añadidos (Etapa 3) ──────────────────────────────────────────────
+mod features;
+mod classify;
+mod hierarchy;
+mod interaction;                                                    // Etapa 4
+
+use hierarchy::{build_ui_semantic_layer, print_ui_tree};
+use interaction::{InteractionEngine, SelectionTarget};             // Etapa 4
+
 // ─── Tipos base ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,7 +62,6 @@ impl Rect {
 struct Region {
     id: usize,
     bbox: Rect,
-    // TODO (Etapa 1): calcular a partir del label_map.
     area: usize,
     perimeter: usize,
     mean_color: (f32, f32, f32),
@@ -136,6 +144,92 @@ fn border_color(mode: SelectionMode) -> u32 {
     }
 }
 
+// ─── Estructuras e Implementación de Regiones de parche.md ────────────────────
+
+struct Dsu {
+    parent: Vec<usize>,
+    size:   Vec<usize>,
+}
+
+impl Dsu {
+    fn new(n: usize) -> Self {
+        Dsu {
+            parent: (0..n).collect(),
+            size:   vec![1; n],
+        }
+    }
+
+    fn find(&mut self, mut i: usize) -> usize {
+        while self.parent[i] != i {
+            self.parent[i] = self.parent[self.parent[i]]; // path halving
+            i = self.parent[i];
+        }
+        i
+    }
+
+    fn union(&mut self, a: usize, b: usize) -> bool {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb { return false; }
+        if self.size[ra] >= self.size[rb] {
+            self.parent[rb] = ra;
+            self.size[ra] += self.size[rb];
+        } else {
+            self.parent[ra] = rb;
+            self.size[rb] += self.size[ra];
+        }
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MergeEdge {
+    cost: f32,
+    a:    usize,
+    b:    usize,
+}
+
+const COLOR_WEIGHT:      f32 = 0.55;
+const SPATIAL_WEIGHT:    f32 = 0.30;
+const SIZE_RATIO_WEIGHT: f32 = 0.15;
+const BASE_K:            f32 = 300.0;
+const SIZE_SCALE:        f32 = 0.5;
+
+fn merge_cost(a: &Region, b: &Region, w: usize, h: usize) -> f32 {
+    let dr = a.mean_color.0 - b.mean_color.0;
+    let dg = a.mean_color.1 - b.mean_color.1;
+    let db = a.mean_color.2 - b.mean_color.2;
+    let color_dist = (dr * dr + dg * dg + db * db).sqrt() / 441.67;
+
+    let gap_x = if a.bbox.xmax < b.bbox.xmin {
+        (b.bbox.xmin - a.bbox.xmax) as f32
+    } else if b.bbox.xmax < a.bbox.xmin {
+        (a.bbox.xmin - b.bbox.xmax) as f32
+    } else {
+        0.0
+    };
+    let gap_y = if a.bbox.ymax < b.bbox.ymin {
+        (b.bbox.ymin - a.bbox.ymax) as f32
+    } else if b.bbox.xmax < a.bbox.xmin {
+        (a.bbox.xmin - b.bbox.xmax) as f32
+    } else {
+        0.0
+    };
+    let diag = ((w * w + h * h) as f32).sqrt();
+    let spatial = (gap_x * gap_x + gap_y * gap_y).sqrt() / diag;
+
+    let sa = a.area.max(1) as f32;
+    let sb = b.area.max(1) as f32;
+    let ratio = if sa > sb { sb / sa } else { sa / sb };
+    let size_penalty = 4.0 * ratio * (1.0 - ratio);
+
+    COLOR_WEIGHT * color_dist + SPATIAL_WEIGHT * spatial + SIZE_RATIO_WEIGHT * size_penalty
+}
+
+fn mint(area: usize) -> f32 {
+    BASE_K / (area.max(1) as f32).powf(SIZE_SCALE)
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -162,6 +256,24 @@ fn main() {
     let blocks = build_region_tree(&regions);
     println!("Se detectaron {} bloques visuales independientes.", blocks.len());
 
+    /* ▶ INICIO BLOQUE DE INTEGRACIÓN (Etapa 3) ----------------------------- */
+    println!("Construyendo capa semántica UI...");
+    let (ui_elements, ui_tree) = build_ui_semantic_layer(&regions, w, h);
+
+    // Debug en consola (quitar en producción o mover a flag --debug)
+    print_ui_tree(&ui_tree);
+
+    println!(
+        "Etapa 3 completa: {} elementos UI clasificados ({} raíces en el árbol).",
+        ui_elements.len(),
+        ui_tree.roots.len(),
+    );
+    /* ▶ FIN BLOQUE DE INTEGRACIÓN --------------------------------------------- */
+
+    // ─── Etapa 4: Motor de Interacción Semántica ─────────────────────────────
+    let engine = InteractionEngine::new();
+    // ─────────────────────────────────────────────────────────────────────────
+
     let snap_rect = |cx: usize, cy: usize| -> (Rect, Option<u32>) {
         let lbl = label_map[cy * w + cx];
         if lbl > 0 && (lbl as usize) <= blocks.len() {
@@ -181,7 +293,11 @@ fn main() {
     window.set_target_fps(60);
 
     let (mut cx, mut cy) = (w / 2, h / 2);
-    let (init_rect, init_label) = snap_rect(cx, cy);
+    let (init_rect, init_label) = engine
+        .compute_smart_snap(&ui_tree, cx, cy)
+        .and_then(|t| engine.resolve_rect(&ui_tree, &t))
+        .map(|r| (r, None::<u32>))
+        .unwrap_or_else(|| snap_rect(cx, cy));
 
     let mut sel = Selection {
         rect: init_rect,
@@ -228,7 +344,26 @@ fn main() {
 
                     if acted {
                         if !sel.rect.expand(SNAP_HYSTERESIS, w, h).contains(cx, cy) {
-                            let (r, lbl) = snap_rect(cx, cy);
+                            // Snap semántico: prioriza importancia sobre distancia pura
+                            let semantic = engine
+                                .compute_smart_snap(&ui_tree, cx, cy)
+                                .and_then(|t| {
+                                    // Log de acción contextual (quitar en producción o usar flag --debug)
+                                    if let SelectionTarget::Element(id) = &t {
+                                        let el = &ui_tree.elements[*id];
+                                        let action = engine.infer_action(el.element_type);
+                                        eprintln!(
+                                            "[snap] id={} type={} action={}",
+                                            id,
+                                            el.element_type.label(),
+                                            action.label()
+                                        );
+                                    }
+                                    engine.resolve_rect(&ui_tree, &t)
+                                })
+                                .map(|r| (r, None::<u32>));
+
+                            let (r, lbl) = semantic.unwrap_or_else(|| snap_rect(cx, cy));
                             sel.rect = r;
                             sel.source_label = lbl;
                         }
@@ -328,11 +463,9 @@ fn main() {
                                 if let Some(ch) = key_to_char(hk) {
                                     match hint_prefix {
                                         None => {
-                                            // Primera tecla: guardar prefijo
                                             hint_prefix = Some(ch);
                                         }
                                         Some(first) => {
-                                            // Segunda tecla: resolver label completo
                                             let label = format!("{}{}", first, ch);
                                             if let Some(candidate_index) = find_hint_by_label(&active_hints, &label) {
                                                 let candidate = &active_candidates[candidate_index];
@@ -569,53 +702,232 @@ fn segment_ui_structure(buf: &[u32], w: usize, h: usize) -> (Vec<u32>, Vec<Rect>
     (labels, rects)
 }
 
-// ─── Pipeline de segmentación (Etapa 0: capa de abstracción pura) ─────────────
+// ─── Pipeline de segmentación (Etapa 1 y Etapa 2 integrada) ──────────────────
 
-/// Punto de entrada del pipeline. Llama a `segment_ui_structure` sin modificarla
-/// y convierte los `Rect` en `Region` con metadatos por defecto.
 fn fh_segment(buf: &[u32], w: usize, h: usize) -> (Vec<u32>, Vec<Region>) {
     let (label_map, rects) = segment_ui_structure(buf, w, h);
+    let n = rects.len();
+
+    let mut area:    Vec<usize> = vec![0;   n];
+    let mut sum_r:   Vec<f64>   = vec![0.0; n];
+    let mut sum_g:   Vec<f64>   = vec![0.0; n];
+    let mut sum_b:   Vec<f64>   = vec![0.0; n];
+    let mut sum_r2:  Vec<f64>   = vec![0.0; n];
+    let mut sum_g2:  Vec<f64>   = vec![0.0; n];
+    let mut sum_b2:  Vec<f64>   = vec![0.0; n];
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            let lbl = label_map[idx];
+            if lbl == 0 { continue; }
+            let rid = (lbl - 1) as usize;
+
+            let p = buf[idx];
+            let r = ((p >> 16) & 0xFF) as f64;
+            let g = ((p >>  8) & 0xFF) as f64;
+            let b = ( p        & 0xFF) as f64;
+
+            area[rid]   += 1;
+            sum_r[rid]  += r;   sum_r2[rid] += r * r;
+            sum_g[rid]  += g;   sum_g2[rid] += g * g;
+            sum_b[rid]  += b;   sum_b2[rid] += b * b;
+
+            if x + 1 < w {
+                let rbl = label_map[idx + 1];
+                if rbl > 0 && rbl != lbl {
+                    let nid = (rbl - 1) as usize;
+                    adj[rid].push(nid);
+                    adj[nid].push(rid);
+                }
+            }
+            if y + 1 < h {
+                let dbl = label_map[idx + w];
+                if dbl > 0 && dbl != lbl {
+                    let nid = (dbl - 1) as usize;
+                    adj[rid].push(nid);
+                    adj[nid].push(rid);
+                }
+            }
+        }
+    }
+
     let regions = rects
         .into_iter()
         .enumerate()
-        .map(|(id, bbox)| Region {
-            id,
-            bbox,
-            // TODO (Etapa 1): calcular area real desde label_map.
-            area: 0,
-            // TODO (Etapa 1): calcular perímetro desde label_map.
-            perimeter: 0,
-            // TODO (Etapa 1): calcular color medio desde buf y label_map.
-            mean_color: (0.0, 0.0, 0.0),
-            // TODO (Etapa 1): calcular varianza de color desde buf y label_map.
-            color_variance: 0.0,
-            // TODO (Etapa 2): poblar vecinos durante merge_regions.
-            neighbors: Vec::new(),
+        .map(|(id, bbox)| {
+            let a = area[id].max(1) as f64;
+            let mr = (sum_r[id] / a) as f32;
+            let mg = (sum_g[id] / a) as f32;
+            let mb = (sum_b[id] / a) as f32;
+
+            let vr = (sum_r2[id] / a) - (sum_r[id] / a).powi(2);
+            let vg = (sum_g2[id] / a) - (sum_g[id] / a).powi(2);
+            let vb = (sum_b2[id] / a) - (sum_b[id] / a).powi(2);
+            let variance = ((vr + vg + vb) / 3.0) as f32;
+
+            let mut neighbors = adj[id].clone();
+            neighbors.sort_unstable();
+            neighbors.dedup();
+
+            Region {
+                id,
+                bbox,
+                area: area[id],
+                perimeter: 0,
+                mean_color: (mr, mg, mb),
+                color_variance: variance,
+                neighbors,
+            }
         })
         .collect();
+
     (label_map, regions)
 }
 
-/// Passthrough — la lógica de fusión llegará en la Etapa 2.
-/// Firma definitiva: los parámetros estarán activos en la Etapa 2.
 fn merge_regions(
-    _label_map: &mut [u32],
-    regions: Vec<Region>,
-    _buf: &[u32],
-    _w: usize,
-    _h: usize,
+    label_map: &mut [u32],
+    regions:   Vec<Region>,
+    _buf:      &[u32],
+    w:         usize,
+    h:         usize,
 ) -> Vec<Region> {
-    // TODO (Etapa 2): implementar fusión basada en Felzenszwalb-Huttenlocher.
-    regions
+    let n = regions.len();
+    if n == 0 { return regions; }
+
+    let mut edges: Vec<MergeEdge> = Vec::with_capacity(n * 4);
+    let mut seen_pairs: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::with_capacity(n * 4);
+
+    for reg in &regions {
+        for &nb in &reg.neighbors {
+            if nb >= n { continue; }
+            let (lo, hi) = if reg.id < nb { (reg.id, nb) } else { (nb, reg.id) };
+            if seen_pairs.insert((lo, hi)) {
+                let cost = merge_cost(&regions[lo], &regions[hi], w, h);
+                edges.push(MergeEdge { cost, a: lo, b: hi });
+            }
+        }
+    }
+
+    edges.sort_unstable_by(|e1, e2| e1.cost.partial_cmp(&e2.cost).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut dsu = Dsu::new(n);
+    let mut comp_area: Vec<usize> = regions.iter().map(|r| r.area.max(1)).collect();
+    let mut comp_mint: Vec<f32> = regions.iter().map(|r| mint(r.area)).collect();
+
+    for edge in &edges {
+        let ra = dsu.find(edge.a);
+        let rb = dsu.find(edge.b);
+        if ra == rb { continue; }
+
+        let threshold = comp_mint[ra].min(comp_mint[rb]);
+        if edge.cost < threshold {
+            dsu.union(ra, rb);
+            let new_root = dsu.find(ra);
+            comp_area[new_root] = comp_area[ra] + comp_area[rb];
+            comp_mint[new_root] = comp_mint[ra].max(comp_mint[rb]).max(edge.cost);
+        }
+    }
+
+    let mut root_to_new: Vec<u32> = vec![u32::MAX; n];
+    let mut new_id_counter: u32 = 0;
+
+    let mut new_bboxes:  Vec<Rect>           = Vec::with_capacity(n / 2 + 1);
+    let mut new_areas:   Vec<usize>          = Vec::with_capacity(n / 2 + 1);
+    let mut new_sum_r:   Vec<f64>            = Vec::with_capacity(n / 2 + 1);
+    let mut new_sum_g:   Vec<f64>            = Vec::with_capacity(n / 2 + 1);
+    let mut new_sum_b:   Vec<f64>            = Vec::with_capacity(n / 2 + 1);
+    let mut new_variance:Vec<f32>            = Vec::with_capacity(n / 2 + 1);
+
+    let mut old_to_new: Vec<u32> = vec![0; n];
+
+    for reg in &regions {
+        let root = dsu.find(reg.id);
+        let nid = if root_to_new[root] == u32::MAX {
+            let id = new_id_counter;
+            root_to_new[root] = id;
+            new_id_counter += 1;
+            new_bboxes.push(reg.bbox);
+            new_areas.push(0);
+            new_sum_r.push(0.0);
+            new_sum_g.push(0.0);
+            new_sum_b.push(0.0);
+            new_variance.push(0.0);
+            id
+        } else {
+            root_to_new[root]
+        };
+
+        old_to_new[reg.id] = nid;
+
+        let ni = nid as usize;
+        new_bboxes[ni] = new_bboxes[ni].union_with(reg.bbox);
+        let a = reg.area as f64;
+        new_areas[ni]  += reg.area;
+        new_sum_r[ni]  += reg.mean_color.0 as f64 * a;
+        new_sum_g[ni]  += reg.mean_color.1 as f64 * a;
+        new_sum_b[ni]  += reg.mean_color.2 as f64 * a;
+        new_variance[ni] = (new_variance[ni] * (new_areas[ni] - reg.area) as f32
+            + reg.color_variance * reg.area as f32)
+            / new_areas[ni] as f32;
+    }
+
+    let num_merged = new_id_counter as usize;
+
+    let mut merged_regions: Vec<Region> = (0..num_merged).map(|i| {
+        let a = new_areas[i].max(1) as f64;
+        Region {
+            id:             i,
+            bbox:           new_bboxes[i],
+            area:           new_areas[i],
+            perimeter:      0,
+            mean_color: (
+                (new_sum_r[i] / a) as f32,
+                (new_sum_g[i] / a) as f32,
+                (new_sum_b[i] / a) as f32,
+            ),
+            color_variance: new_variance[i],
+            neighbors: Vec::new(),
+        }
+    }).collect();
+
+    for lbl in label_map.iter_mut() {
+        if *lbl > 0 {
+            let old_0 = (*lbl - 1) as usize;
+            if old_0 < n {
+                *lbl = old_to_new[old_0] + 1;
+            }
+        }
+    }
+
+    {
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); num_merged];
+        for edge in &edges {
+            let na = old_to_new[edge.a] as usize;
+            let nb = old_to_new[edge.b] as usize;
+            if na != nb {
+                adj[na].push(nb);
+                adj[nb].push(na);
+            }
+        }
+        for (i, nbrs) in adj.into_iter().enumerate() {
+            let mut v = nbrs;
+            v.sort_unstable();
+            v.dedup();
+            merged_regions[i].neighbors = v;
+        }
+    }
+
+    merged_regions
 }
 
-/// Construye la representación final de regiones como Vec<Rect>,
-/// con el resto del código que opera sobre `Vec<Rect>`.
 fn build_region_tree(regions: &[Region]) -> Vec<Rect> {
     regions.iter().map(|r| r.bbox).collect()
 }
 
-// ─── HintMode: pipeline de datos (sin dependencias de renderizado) ────────────
+// ─── HintMode: pipeline de datos ──────────────────────────────────────────────
 
 const HINT_MIN_AREA: usize       = 400;
 const HINT_MIN_DIMENSION: usize  = 8;
