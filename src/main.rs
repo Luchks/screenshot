@@ -47,6 +47,20 @@ impl Rect {
     }
 }
 
+// ─── Region: abstracción de segmento para pipeline futuro ─────────────────────
+
+#[derive(Clone, Debug)]
+struct Region {
+    id: usize,
+    bbox: Rect,
+    // TODO (Etapa 1): calcular a partir del label_map.
+    area: usize,
+    perimeter: usize,
+    mean_color: (f32, f32, f32),
+    color_variance: f32,
+    neighbors: Vec<usize>,
+}
+
 // ─── HintMode: modelo de datos ────────────────────────────────────────────────
 
 struct CandidateId(usize);
@@ -136,8 +150,16 @@ fn main() {
 
     let mut render_buffer = clean_buffer.clone();
 
-    println!("Analizando estructura de la interfaz...");
-    let (label_map, blocks) = segment_ui_structure(&clean_buffer, w, h);
+    println!("Analizando estructura de la interfaz (Pipeline)...");
+    let (mut label_map, mut regions) = fh_segment(&clean_buffer, w, h);
+    regions = merge_regions(
+        &mut label_map,
+        regions,
+        &clean_buffer,
+        w,
+        h,
+    );
+    let blocks = build_region_tree(&regions);
     println!("Se detectaron {} bloques visuales independientes.", blocks.len());
 
     let snap_rect = |cx: usize, cy: usize| -> (Rect, Option<u32>) {
@@ -545,6 +567,52 @@ fn segment_ui_structure(buf: &[u32], w: usize, h: usize) -> (Vec<u32>, Vec<Rect>
         }
     }
     (labels, rects)
+}
+
+// ─── Pipeline de segmentación (Etapa 0: capa de abstracción pura) ─────────────
+
+/// Punto de entrada del pipeline. Llama a `segment_ui_structure` sin modificarla
+/// y convierte los `Rect` en `Region` con metadatos por defecto.
+fn fh_segment(buf: &[u32], w: usize, h: usize) -> (Vec<u32>, Vec<Region>) {
+    let (label_map, rects) = segment_ui_structure(buf, w, h);
+    let regions = rects
+        .into_iter()
+        .enumerate()
+        .map(|(id, bbox)| Region {
+            id,
+            bbox,
+            // TODO (Etapa 1): calcular area real desde label_map.
+            area: 0,
+            // TODO (Etapa 1): calcular perímetro desde label_map.
+            perimeter: 0,
+            // TODO (Etapa 1): calcular color medio desde buf y label_map.
+            mean_color: (0.0, 0.0, 0.0),
+            // TODO (Etapa 1): calcular varianza de color desde buf y label_map.
+            color_variance: 0.0,
+            // TODO (Etapa 2): poblar vecinos durante merge_regions.
+            neighbors: Vec::new(),
+        })
+        .collect();
+    (label_map, regions)
+}
+
+/// Passthrough — la lógica de fusión llegará en la Etapa 2.
+/// Firma definitiva: los parámetros estarán activos en la Etapa 2.
+fn merge_regions(
+    _label_map: &mut [u32],
+    regions: Vec<Region>,
+    _buf: &[u32],
+    _w: usize,
+    _h: usize,
+) -> Vec<Region> {
+    // TODO (Etapa 2): implementar fusión basada en Felzenszwalb-Huttenlocher.
+    regions
+}
+
+/// Construye la representación final de regiones como Vec<Rect>,
+/// con el resto del código que opera sobre `Vec<Rect>`.
+fn build_region_tree(regions: &[Region]) -> Vec<Rect> {
+    regions.iter().map(|r| r.bbox).collect()
 }
 
 // ─── HintMode: pipeline de datos (sin dependencias de renderizado) ────────────
